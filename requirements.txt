@@ -1,0 +1,10 @@
+pytorch-lightning
+transformers
+pycocotools
+wandb
+huggingface_hub[cli]
+hf-hub-lightning
+kagglehub
+coco-eval
+scipy
+timm
