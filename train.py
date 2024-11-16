@@ -13,6 +13,8 @@ wandb.login(key="52be99a40710a38857e86cb163238de4e437a074")
 import torchvision
 import os
 
+base_model = "vietlethe/bkad-deformable-detr"
+
 class CocoDetection(torchvision.datasets.CocoDetection):
     def __init__(self, img_folder, processor, train=True):
         ann_file = os.path.join(img_folder, "annotations.json")
@@ -36,7 +38,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
 
 # %%
 from transformers import AutoImageProcessor
-processor = AutoImageProcessor.from_pretrained("SenseTime/deformable-detr")
+processor = AutoImageProcessor.from_pretrained(base_model)
 
 train_dataset = CocoDetection(img_folder='dataset/train', processor=processor)
 val_dataset = CocoDetection(img_folder='dataset/val', processor=processor, train=False)
@@ -50,28 +52,8 @@ import numpy as np
 import os
 from PIL import Image, ImageDraw
 
-# based on https://github.com/woctezuma/finetune-detr/blob/master/finetune_detr.ipynb
-image_ids = train_dataset.coco.getImgIds()
-# let's pick a random image
-image_id = image_ids[np.random.randint(0, len(image_ids))]
-print('Image n°{}'.format(image_id))
-image = train_dataset.coco.loadImgs(image_id)[0]
-image = Image.open(os.path.join('dataset/train', image['file_name']))
-
-annotations = train_dataset.coco.imgToAnns[image_id]
-draw = ImageDraw.Draw(image, "RGBA")
-
 cats = train_dataset.coco.cats
 id2label = {k: v['name'] for k,v in cats.items()}
-
-for annotation in annotations:
-  box = annotation['bbox']
-  class_idx = annotation['category_id']
-  x,y,w,h = tuple(box)
-  draw.rectangle((x,y,x+w,y+h), outline='red', width=1)
-  draw.text((x, y), id2label[class_idx], fill='white')
-
-image
 
 # %%
 from torch.utils.data import DataLoader
@@ -106,13 +88,15 @@ import pytorch_lightning as pl
 from transformers import DeformableDetrForObjectDetection
 import torch
 
+base_model = "vietlethe/bkad-deformable-detr"
+
 class Detr(pl.LightningModule):
      def __init__(self, lr, lr_backbone, weight_decay):
          super().__init__()
          # replace COCO classification head with custom head
          # we specify the "no_timm" variant here to not rely on the timm library
          # for the convolutional backbone
-         self.model = DeformableDetrForObjectDetection.from_pretrained("SenseTime/deformable-detr",
+         self.model = DeformableDetrForObjectDetection.from_pretrained(base_model,
                                                              num_labels=len(id2label),
                                                              ignore_mismatched_sizes=True)
          # see https://github.com/PyTorchLightning/pytorch-lightning/pull/1896
@@ -174,35 +158,10 @@ class Detr(pl.LightningModule):
      def val_dataloader(self):
         return val_dataloader
 
-
 # %%
 model = Detr(lr=1e-4, lr_backbone=1e-5, weight_decay=1e-4)
 
 outputs = model(pixel_values=batch['pixel_values'], pixel_mask=batch['pixel_mask'])
-
-# %%
-# (batch_size, num_queries, number of classes + 1)
-outputs.logits.shape
-
-# %%
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning import Trainer
-
-wandb_logger = WandbLogger(log_model="all")
-
-trainer = Trainer(
-    max_steps=-1,
-    max_epochs=3,
-    gradient_clip_val=0.1,
-    accelerator="gpu",
-    devices=[0],
-    logger=wandb_logger)
-
-trainer.fit(model)
-
-# %%
-model.model.push_to_hub("vietlethe/bkad-deformable-detr")
-processor.push_to_hub("vietlethe/bkad-deformable-detr")
 
 # %%
 def convert_to_xywh(boxes):
@@ -234,54 +193,165 @@ def prepare_for_coco_detection(predictions):
     return coco_results
 
 # %%
-from transformers import AutoImageProcessor, DeformableDetrForObjectDetection
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning import Trainer
+
+import pytorch_lightning as pl
+from typing import Any, Dict, Optional
 import torch
+import logging
+import sys
+import shutil
 
-id2label = {
-    0:'motorbike',
-    1:'automobile',
-    2:'passenger car',
-    3:'truck'
-}
+# Create a formatter
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-model = DeformableDetrForObjectDetection.from_pretrained("vietlethe/bkad-deformable-detr", id2label=id2label)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-processor = AutoImageProcessor.from_pretrained("vietlethe/bkad-deformable-detr")
+# Set up the root lightning logger
+lightning_logger = logging.getLogger("lightning.pytorch")
+lightning_logger.setLevel(logging.INFO)
+
+# Add both file and console handlers
+file_handler = logging.FileHandler("training.log")
+file_handler.setFormatter(formatter)
+lightning_logger.addHandler(file_handler)
+
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(formatter)
+lightning_logger.addHandler(console_handler)
+
+class TrainingCallback(pl.Callback):
+    def __init__(
+        self,
+        monitor_metric: str = "val_loss",
+        patience: int = 3,
+        min_delta: float = 0.001,
+        save_path: Optional[str] = None,
+        logging_interval: int = 1,
+        evaluate_mAP_interval: int = 2
+    ):
+        super().__init__()
+        self.monitor_metric = monitor_metric
+        self.patience = patience
+        self.min_delta = min_delta
+        self.save_path = save_path
+        self.logging_interval = logging_interval
+        self.evaluate_mAP_interval = evaluate_mAP_interval
+        
+        self.best_score = float('inf')
+        self.counter = 0
+        # Use the existing lightning logger instead of creating a new one
+        self.logger = logging.getLogger("lightning.pytorch")
+        
+        # Test the logger
+        self.logger.info("Callback initialized successfully")
+
+        self.logger.info("logger init")
+
+    def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Called when training begins."""
+        self.logger.info(f"Starting training with {trainer.max_epochs} epochs")
+        
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Called when a training epoch begins."""
+        self.logger.info(f"Starting epoch {trainer.current_epoch + 1}/{trainer.max_epochs}")
+        
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: Dict[str, Any],
+        batch: Any,
+        batch_idx: int
+    ) -> None:
+        """Called when a training batch ends."""
+        if batch_idx % self.logging_interval == 0:
+            self.logger.info(
+                f"Epoch {trainer.current_epoch + 1}, "
+                f"Batch {batch_idx}, "
+                f"Loss: {outputs['loss'].item():.4f}"
+            )
+
+    def save_hf_model(self, name):
+        self.logger.info(f"save {name} model")
+        try:
+          model.model.push_to_hub(name)
+          processor.push_to_hub(name)
+        except:
+            self.logger.error("cannot push model to hub!")
+
+        if os.path.exists(name):
+          shutil.rmtree(name)
+
+        model.model.save_pretrained(name)
+        processor.save_pretrained(name)
+
+        self.logger.info(f"save {name} model completed!")
+
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """
+        Called when validation ends. Handles early stopping and model saving logic.
+        """
+        # Get current validation metric
+        current_score = trainer.callback_metrics.get(self.monitor_metric)
+        
+        if current_score is None:
+            self.logger.warning(f"Metric {self.monitor_metric} not found in callback_metrics")
+            return
+        
+        last_path = "vietlethe/bkad-deformable-detr_last"
+        best_path = "vietlethe/bkad-deformable-detr_best"
+
+        self.save_hf_model(last_path)
+
+        # Check if score improved
+        if current_score < self.best_score - self.min_delta:
+            self.best_score = current_score
+            self.counter = 0
+
+            self.logger.info(f"Saving best model with {self.monitor_metric}: {current_score:.4f}")
+            self.save_hf_model(best_path)
+                # torch.save(pl_module.state_dict(), self.save_path)
+        else:
+            self.counter += 1
+            
+        # Early stopping check
+        if self.counter >= self.patience:
+            self.logger.info(
+                f"Early stopping triggered: no improvement in {self.monitor_metric} "
+                f"for {self.patience} epochs"
+            )
+            trainer.should_stop = True
+
+        if trainer.current_epoch + 1 % self.evaluate_mAP_interval == 0:
+            pass
+          #  evaluate_mAP()
+
+    def on_train_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        """Called when training ends."""
+        self.logger.info(
+            f"Training completed. Best {self.monitor_metric}: {self.best_score:.4f}"
+        )
+
+wandb_logger = WandbLogger(log_model="all")
+
+callback = TrainingCallback(
+    monitor_metric="validation_cardinality_error",
+    patience=10,
+    save_path="best_model.pt",
+    logging_interval=50
+)
+
+trainer = Trainer(
+    max_steps=-1,
+    max_epochs=10,
+    gradient_clip_val=0.1,
+    accelerator="gpu",
+    devices=[0],
+    callbacks=[callback],
+    logger=wandb_logger)
+
+trainer.fit(model)
 
 # %%
-from coco_eval import CocoEvaluator
-from tqdm.notebook import tqdm
-
-import numpy as np
-
-# initialize evaluator with ground truth (gt)
-evaluator = CocoEvaluator(coco_gt=val_dataset.coco, iou_types=["bbox"])
-
-print("Running evaluation...")
-for idx, batch in enumerate(tqdm(val_dataloader)):
-    # get the inputs
-    pixel_values = batch["pixel_values"].to(device)
-    pixel_mask = batch["pixel_mask"].to(device)
-    labels = [{k: v.to(device) for k, v in t.items()} for t in batch["labels"]] # these are in DETR format, resized + normalized
-
-    # forward pass
-    with torch.no_grad():
-      outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
-
-    # turn into a list of dictionaries (one item for each example in the batch)
-    orig_target_sizes = torch.stack([target["orig_size"] for target in labels], dim=0)
-    results = processor.post_process_object_detection(outputs, target_sizes=orig_target_sizes, threshold=0)
-
-    # provide to metric
-    # metric expects a list of dictionaries, each item
-    # containing image_id, category_id, bbox and score keys
-    predictions = {target['image_id'].item(): output for target, output in zip(labels, results)}
-    predictions = prepare_for_coco_detection(predictions)
-    evaluator.update(predictions)
-
-evaluator.synchronize_between_processes()
-evaluator.accumulate()
-evaluator.summarize()
-
-
+model.model.push_to_hub("vietlethe/bkad-deformable-detr_last")
+processor.push_to_hub("vietlethe/bkad-deformable-detr_last")

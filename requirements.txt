@@ -8,3 +8,4 @@ kagglehub
 coco-eval
 scipy
 timm
+torch-vision
