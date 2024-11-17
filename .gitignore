@@ -182,3 +182,4 @@ wandb/
 vietlethe/
 vietlethe/
 lightning_logs/
+.vscode
